@@ -11,7 +11,8 @@ import html
 import math
 import random
 import zlib
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -24,6 +25,8 @@ import logic
 from simulator import generate_data
 
 HISTORY_DAYS = 14
+NASA_REFRESH_SECONDS = 6 * 3600  # NASA-dan təzə məlumat neçə saniyədən bir çəkilir
+NASA_RETRY_SECONDS = 300         # xətadan sonra təkrar cəhdə qədər fasilə
 SOURCE_REAL, SOURCE_SIM = "Real data", "Simulyasiya"
 
 # Rənglər: gecə səması. Status rəngləri yalnız üç səviyyə üçündür, qalan hər şey sakitdir.
@@ -54,9 +57,42 @@ def refresh_database() -> int:
     return db.save_asteroids(data_loader.load_csv())
 
 
+def nasa_api_key() -> str:
+    """Açar: Streamlit secrets, sonra mühit / .env, heç biri yoxdursa NASA-nın açıq DEMO_KEY-i."""
+    try:
+        key = st.secrets.get("NASA_API_KEY")
+    except Exception:  # secrets faylı yoxdur
+        key = None
+    return key or data_loader.load_api_key() or "DEMO_KEY"
+
+
+@st.cache_data(ttl=NASA_REFRESH_SECONDS, show_spinner="NASA-dan məlumat yüklənir…")
+def sync_from_nasa(days: int, day: str) -> str:
+    """NASA NeoWs-dan son `days` günü çəkib bazaya yazır; yüklənmə vaxtını qaytarır.
+
+    Uğursuz olsa xəta atır (keşlənmir). `day` keşi hər yeni gündə yeniləyir.
+    """
+    db.init_db()
+    db.save_asteroids(data_loader.fetch_recent(nasa_api_key(), days))
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def try_sync_from_nasa(days: int) -> tuple[str | None, str | None]:
+    """(yüklənmə vaxtı, xəta). Xətadan sonra bu sessiyada 5 dəqiqə təkrar cəhd etmir."""
+    failed_at, error = st.session_state.get("nasa_failure", (0.0, None))
+    if time.time() - failed_at < NASA_RETRY_SECONDS:
+        return None, error
+    try:
+        return sync_from_nasa(days, date.today().isoformat()), None
+    except Exception as exc:  # şəbəkə, limit, gözlənilməz cavab: CSV ilə davam edirik
+        error = data_loader.describe_error(exc)
+        st.session_state["nasa_failure"] = (time.time(), error)
+        return None, error
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def load_history(days: int) -> pd.DataFrame:
-    """Son `days` gün: bazadan oxu, logic ilə təsnif et."""
+def load_history(days: int, version: str | None = None) -> pd.DataFrame:
+    """Son `days` gün: bazadan oxu, logic ilə təsnif et. `version` dəyişəndə keş yenilənir."""
     return logic.classify_df(db.get_asteroids(days))
 
 
@@ -270,21 +306,28 @@ with st.sidebar:
                                      f"{HISTORY_DAYS} = bu gün.")
         st.caption(f"{HISTORY_DAYS} gün: {window_start} – {today}. Hər gün 3–8 təsadüfi asteroid.")
     else:
-        st.caption("Mənbə: asteroid.db (data/asteroids.csv-dən yüklənir).")
-        if st.button("Bazanı CSV-dən yenilə"):
-            n = refresh_database()
+        if st.button("NASA-dan yenilə"):
+            sync_from_nasa.clear()
             load_history.clear()
-            st.success(f"{n} sətir yazıldı.")
+            st.session_state.pop("nasa_failure", None)
 
 if source == SOURCE_SIM:
     history = load_simulation(HISTORY_DAYS, window_start, int(sim_seed), int(sim_red_day))
     source_note = f"simulyasiya, seed {int(sim_seed)}"
 else:
     db.init_db()
-    if db.count_asteroids() == 0:  # baza boşdursa CSV-dən doldur
+    if db.count_asteroids() == 0:  # ehtiyat: NASA əlçatmaz olsa da ekran boş qalmasın
         refresh_database()
-    history = load_history(HISTORY_DAYS)
-    source_note = "asteroid.db"
+    synced_at, sync_error = try_sync_from_nasa(HISTORY_DAYS)
+    history = load_history(HISTORY_DAYS, synced_at)
+    with st.sidebar:
+        if synced_at:
+            source_note = "NASA NeoWs"
+            st.caption(f"Mənbə: NASA NeoWs API. Son yüklənmə: {synced_at}.")
+        else:
+            source_note = "saxlanmış məlumat (data/asteroids.csv)"
+            st.caption(f"NASA API əlçatmazdır ({sync_error}). Saxlanmış məlumat göstərilir: "
+                       f"son tarix {db.get_latest_date() or 'yoxdur'}.")
 
 st.markdown(
     f"""
@@ -299,9 +342,7 @@ st.markdown(
 if history.empty:
     st.warning(
         f"Son {HISTORY_DAYS} gündə bazada asteroid yoxdur. "
-        "Yeni məlumat yükləmək üçün `python data_loader.py` işə salın (data/asteroids.csv), "
-        "sonra yan paneldə \"Bazanı CSV-dən yenilə\" düyməsini basın, "
-        "və ya yan paneldən Simulyasiya seçin."
+        "Yan paneldə \"NASA-dan yenilə\" düyməsini basın və ya Simulyasiya seçin."
     )
     st.stop()
 

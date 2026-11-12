@@ -103,6 +103,24 @@ def fetch_asteroids(api_key, start, end):
     return sorted(rows, key=lambda row: (row["date"], row["name"]))
 
 
+def fetch_recent(api_key, days=14, today=None):
+    """Return the last `days` days (today included) from NeoWs as a table with TABLE_COLUMNS.
+
+    The feed allows at most 7 days per request, so the range is fetched in 7-day chunks.
+    Raises requests.RequestException / ValueError if the API cannot be used.
+    """
+    end = today or date.today()
+    start = end - timedelta(days=days - 1)
+    rows = []
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(chunk_start + timedelta(days=6), end)
+        rows.extend(fetch_asteroids(api_key, chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
+    df = pd.DataFrame(rows, columns=COLUMNS).rename(columns=CSV_TO_TABLE)[TABLE_COLUMNS]
+    return df.drop_duplicates(subset=["name", "date"]).reset_index(drop=True)
+
+
 def generate_sample_data(start, count=SAMPLE_ROW_COUNT):
     """Return reproducible placeholder rows spread across the 7-day range."""
     rng = random.Random(42)
